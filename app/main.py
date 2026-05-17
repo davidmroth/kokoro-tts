@@ -4,6 +4,7 @@ from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 import os
+import re
 from tempfile import NamedTemporaryFile
 from urllib.request import urlopen
 
@@ -15,6 +16,7 @@ import soundfile as sf
 
 DEFAULT_MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"
 DEFAULT_VOICES_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
+_DECIMAL_PATTERN = re.compile(r"(?<!\d)(\d+)\.(\d+)(?!\d)")
 
 
 def _model_dir() -> Path:
@@ -56,6 +58,13 @@ def _engine() -> Kokoro:
     return Kokoro(str(_model_path()), str(_voices_path()))
 
 
+def _normalize_text(text: str, *, lang: str) -> str:
+    if not lang.lower().startswith("en"):
+        return text
+
+    return _DECIMAL_PATTERN.sub(r"\1 point \2", text)
+
+
 def _render_wav_bytes(text: str, *, voice: str, lang: str, speed: float) -> bytes:
     samples, sample_rate = _engine().create(text, voice=voice, speed=speed, lang=lang)
     buffer = BytesIO()
@@ -93,10 +102,11 @@ def tts(
     resolved_voice = (voice or os.getenv("KOKORO_VOICE", "af_sky")).strip() or "af_sky"
     resolved_lang = (lang or os.getenv("KOKORO_LANG", "en-us")).strip() or "en-us"
     resolved_speed = speed if speed is not None else float(os.getenv("KOKORO_SPEED", "1.0"))
+    normalized_text = _normalize_text(cleaned_text, lang=resolved_lang)
 
     try:
         audio_bytes = _render_wav_bytes(
-            cleaned_text,
+            normalized_text,
             voice=resolved_voice,
             lang=resolved_lang,
             speed=resolved_speed,
