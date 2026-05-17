@@ -3,20 +3,38 @@ from __future__ import annotations
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
+import json
 import os
 import re
 from tempfile import NamedTemporaryFile
+from threading import RLock
 from urllib.request import urlopen
 
 from fastapi import FastAPI, Form, HTTPException
 from fastapi.responses import Response
 from kokoro_onnx import Kokoro
+from pydantic import BaseModel
 import soundfile as sf
 
 
 DEFAULT_MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"
 DEFAULT_VOICES_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
 _DECIMAL_PATTERN = re.compile(r"(?<!\d)(\d+)\.(\d+)(?!\d)")
+_PRONUNCIATION_LOCK = RLock()
+
+
+class PronunciationEntry(BaseModel):
+    phrase: str
+    pronunciation: str
+
+
+class PronunciationBulkUpdate(BaseModel):
+    entries: list[PronunciationEntry]
+
+
+class PronunciationEdit(BaseModel):
+    phrase: str | None = None
+    pronunciation: str | None = None
 
 
 def _model_dir() -> Path:
@@ -29,6 +47,14 @@ def _model_path() -> Path:
 
 def _voices_path() -> Path:
     return _model_dir() / os.getenv("KOKORO_VOICES_FILENAME", "voices-v1.0.bin")
+
+
+def _pronunciations_path() -> Path:
+    configured_path = os.getenv("KOKORO_PRONUNCIATIONS_PATH", "").strip()
+    if configured_path:
+        return Path(configured_path)
+
+    return _model_dir() / "pronunciations.json"
 
 
 def _download(url: str, destination: Path) -> None:
@@ -58,11 +84,83 @@ def _engine() -> Kokoro:
     return Kokoro(str(_model_path()), str(_voices_path()))
 
 
-def _normalize_text(text: str, *, lang: str) -> str:
-    if not lang.lower().startswith("en"):
-        return text
+def _load_pronunciations() -> dict[str, str]:
+    pronunciation_path = _pronunciations_path()
+    if not pronunciation_path.exists():
+        return {}
 
-    return _DECIMAL_PATTERN.sub(r"\1 point \2", text)
+    with pronunciation_path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    if not isinstance(data, dict):
+        raise ValueError("pronunciations file must contain a JSON object")
+
+    pronunciations: dict[str, str] = {}
+    for phrase, pronunciation in data.items():
+        if not isinstance(phrase, str) or not isinstance(pronunciation, str):
+            raise ValueError("pronunciations file must map strings to strings")
+        cleaned_phrase = phrase.strip()
+        cleaned_pronunciation = pronunciation.strip()
+        if cleaned_phrase and cleaned_pronunciation:
+            pronunciations[cleaned_phrase] = cleaned_pronunciation
+
+    return pronunciations
+
+
+def _save_pronunciations(pronunciations: dict[str, str]) -> dict[str, str]:
+    cleaned = dict(sorted(pronunciations.items(), key=lambda item: item[0].lower()))
+    pronunciation_path = _pronunciations_path()
+    pronunciation_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with NamedTemporaryFile("w", dir=pronunciation_path.parent, delete=False, encoding="utf-8") as tmp_file:
+        json.dump(cleaned, tmp_file, indent=2, ensure_ascii=True, sort_keys=True)
+        tmp_file.write("\n")
+        temp_path = Path(tmp_file.name)
+
+    temp_path.replace(pronunciation_path)
+    return cleaned
+
+
+def _normalize_phrase(value: str, *, field_name: str) -> str:
+    cleaned_value = value.strip()
+    if not cleaned_value:
+        raise HTTPException(status_code=400, detail=f"{field_name} is required")
+    return cleaned_value
+
+
+def _normalize_entry(entry: PronunciationEntry) -> tuple[str, str]:
+    return (
+        _normalize_phrase(entry.phrase, field_name="phrase"),
+        _normalize_phrase(entry.pronunciation, field_name="pronunciation"),
+    )
+
+
+def _phrase_pattern(phrase: str) -> re.Pattern[str]:
+    prefix = r"(?<!\w)" if phrase[:1].isalnum() else ""
+    suffix = r"(?!\w)" if phrase[-1:].isalnum() else ""
+    return re.compile(f"{prefix}{re.escape(phrase)}{suffix}")
+
+
+def _apply_pronunciations(text: str) -> str:
+    updated_text = text
+    for phrase, pronunciation in sorted(_load_pronunciations().items(), key=lambda item: len(item[0]), reverse=True):
+        updated_text = _phrase_pattern(phrase).sub(pronunciation, updated_text)
+    return updated_text
+
+
+def _list_pronunciations() -> list[dict[str, str]]:
+    return [
+        {"phrase": phrase, "pronunciation": pronunciation}
+        for phrase, pronunciation in _load_pronunciations().items()
+    ]
+
+
+def _normalize_text(text: str, *, lang: str) -> str:
+    rewritten_text = _apply_pronunciations(text)
+    if not lang.lower().startswith("en"):
+        return rewritten_text
+
+    return _DECIMAL_PATTERN.sub(r"\1 point \2", rewritten_text)
 
 
 def _render_wav_bytes(text: str, *, voice: str, lang: str, speed: float) -> bytes:
@@ -86,6 +184,95 @@ def healthz() -> dict[str, str]:
 @app.get("/voices")
 def voices() -> dict[str, list[str]]:
     return {"voices": sorted(_engine().get_voices())}
+
+
+@app.post("/pronunciations")
+def upsert_pronunciation(entry: PronunciationEntry) -> dict[str, object]:
+    phrase, pronunciation = _normalize_entry(entry)
+
+    with _PRONUNCIATION_LOCK:
+        pronunciations = _load_pronunciations()
+        pronunciations[phrase] = pronunciation
+        saved = _save_pronunciations(pronunciations)
+
+    return {
+        "status": "ok",
+        "entry": {"phrase": phrase, "pronunciation": pronunciation},
+        "count": len(saved),
+    }
+
+
+@app.post("/pronunciations/bulk")
+def bulk_upsert_pronunciations(update: PronunciationBulkUpdate) -> dict[str, object]:
+    if not update.entries:
+        raise HTTPException(status_code=400, detail="entries are required")
+
+    normalized_entries = [_normalize_entry(entry) for entry in update.entries]
+
+    with _PRONUNCIATION_LOCK:
+        pronunciations = _load_pronunciations()
+        for phrase, pronunciation in normalized_entries:
+            pronunciations[phrase] = pronunciation
+        saved = _save_pronunciations(pronunciations)
+
+    return {
+        "status": "ok",
+        "updated": len(normalized_entries),
+        "count": len(saved),
+        "entries": [
+            {"phrase": phrase, "pronunciation": pronunciation}
+            for phrase, pronunciation in normalized_entries
+        ],
+    }
+
+
+@app.patch("/pronunciations/{phrase}")
+def edit_pronunciation(phrase: str, update: PronunciationEdit) -> dict[str, object]:
+    current_phrase = _normalize_phrase(phrase, field_name="phrase")
+    if update.phrase is None and update.pronunciation is None:
+        raise HTTPException(status_code=400, detail="phrase or pronunciation is required")
+
+    with _PRONUNCIATION_LOCK:
+        pronunciations = _load_pronunciations()
+        current_pronunciation = pronunciations.get(current_phrase)
+        if current_pronunciation is None:
+            raise HTTPException(status_code=404, detail="pronunciation not found")
+
+        next_phrase = _normalize_phrase(update.phrase, field_name="phrase") if update.phrase is not None else current_phrase
+        next_pronunciation = (
+            _normalize_phrase(update.pronunciation, field_name="pronunciation")
+            if update.pronunciation is not None
+            else current_pronunciation
+        )
+
+        if next_phrase != current_phrase:
+            pronunciations.pop(current_phrase, None)
+        pronunciations[next_phrase] = next_pronunciation
+        saved = _save_pronunciations(pronunciations)
+
+    return {
+        "status": "ok",
+        "entry": {"phrase": next_phrase, "pronunciation": next_pronunciation},
+        "count": len(saved),
+    }
+
+
+@app.delete("/pronunciations/{phrase}")
+def delete_pronunciation(phrase: str) -> dict[str, object]:
+    current_phrase = _normalize_phrase(phrase, field_name="phrase")
+
+    with _PRONUNCIATION_LOCK:
+        pronunciations = _load_pronunciations()
+        deleted_pronunciation = pronunciations.pop(current_phrase, None)
+        if deleted_pronunciation is None:
+            raise HTTPException(status_code=404, detail="pronunciation not found")
+        saved = _save_pronunciations(pronunciations)
+
+    return {
+        "status": "ok",
+        "deleted": {"phrase": current_phrase, "pronunciation": deleted_pronunciation},
+        "count": len(saved),
+    }
 
 
 @app.post("/tts")
