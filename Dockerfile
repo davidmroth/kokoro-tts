@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends espeak-ng libsndfile1 \
+    && apt-get install -y --no-install-recommends espeak-ng gcc g++ libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY .services/kokoro-tts/requirements.txt /tmp/requirements.txt

@@ -21,6 +21,7 @@ DEFAULT_MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/downlo
 DEFAULT_VOICES_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
 _DECIMAL_PATTERN = re.compile(r"(?<!\d)(\d+)\.(\d+)(?!\d)")
 _PRONUNCIATION_LOCK = RLock()
+_NEMO_INIT_LOCK = RLock()
 
 
 class PronunciationEntry(BaseModel):
@@ -155,9 +156,76 @@ def _list_pronunciations() -> list[dict[str, str]]:
     ]
 
 
+@lru_cache(maxsize=1)
+def _nemo_normalizer_factory():
+    try:
+        from nemo_text_processing.text_normalization.normalize import Normalizer
+    except Exception:
+        return None
+
+    try:
+        return Normalizer(input_case="cased", lang="en")
+    except Exception:
+        return None
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_with_nemo(text: str) -> str | None:
+    # Normalizer initialization and grammar loading can be expensive.
+    with _NEMO_INIT_LOCK:
+        normalizer = _nemo_normalizer_factory()
+    if normalizer is None:
+        return None
+
+    punct_post_process = _bool_env("KOKORO_NEMO_PUNCT_POST_PROCESS", True)
+    try:
+        sentences = normalizer.split_text_into_sentences(text)
+        if sentences:
+            normalized_sentences = normalizer.normalize_list(
+                sentences,
+                punct_post_process=punct_post_process,
+            )
+            if normalized_sentences:
+                return " ".join(segment.strip() for segment in normalized_sentences if segment.strip())
+
+        normalized_text = normalizer.normalize(
+            text,
+            punct_post_process=punct_post_process,
+        )
+        if isinstance(normalized_text, str) and normalized_text.strip():
+            return normalized_text
+    except Exception:
+        return None
+
+    return None
+
+
 def _normalize_text(text: str, *, lang: str) -> str:
     rewritten_text = _apply_pronunciations(text)
     if not lang.lower().startswith("en"):
+        return rewritten_text
+
+    backend = os.getenv("KOKORO_TEXT_NORMALIZATION_BACKEND", "auto").strip().lower() or "auto"
+    if backend not in {"auto", "nemo", "regex", "off"}:
+        backend = "auto"
+
+    if backend in {"auto", "nemo"}:
+        nemo_output = _normalize_with_nemo(rewritten_text)
+        if nemo_output is not None:
+            return nemo_output
+        if backend == "nemo":
+            raise HTTPException(
+                status_code=500,
+                detail="NeMo normalization requested but unavailable",
+            )
+
+    if backend == "off":
         return rewritten_text
 
     return _DECIMAL_PATTERN.sub(r"\1 point \2", rewritten_text)
